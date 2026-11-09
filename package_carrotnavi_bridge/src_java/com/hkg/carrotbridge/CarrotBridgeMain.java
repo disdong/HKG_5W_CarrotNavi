@@ -2483,9 +2483,41 @@ public class CarrotBridgeMain {
         return sb.toString();
     }
 
+    /** Numeric dotted-version compare ("1.2.10" > "1.2.9"); non-numeric parts count as 0. */
+    static int compareVersions(String a, String b) {
+        String[] pa = (a == null ? "" : a.trim()).split("\\.");
+        String[] pb = (b == null ? "" : b.trim()).split("\\.");
+        int n = Math.max(pa.length, pb.length);
+        for (int i = 0; i < n; i++) {
+            int x = i < pa.length ? parseIntSafe(pa[i].replaceAll("[^0-9]", ""), 0) : 0;
+            int y = i < pb.length ? parseIntSafe(pb[i].replaceAll("[^0-9]", ""), 0) : 0;
+            if (x != y) return x < y ? -1 : 1;
+        }
+        return 0;
+    }
+
+    /** Honors "auto_update_enabled": false in the installed config/bridge_config.json (was previously ignored). */
+    static boolean isAutoUpdateEnabled(String installDir) {
+        try {
+            File conf = new File(installDir, "config/bridge_config.json");
+            if (!conf.isFile()) return true;
+            String json = new String(readAllBytes(new FileInputStream(conf)), UTF8);
+            return !Pattern.compile("\"auto_update_enabled\"\\s*:\\s*false").matcher(json).find();
+        } catch (Throwable t) {
+            return true;
+        }
+    }
+
     public static int runAutoUpdate(String owner, String repo, String branch, String installDir, boolean force) {
         String nowStr = new SimpleDateFormat("HH:mm:ss", Locale.US).format(new Date());
         File statusNoteFile = new File(installDir, "config/last_update_status.txt");
+        if (!force && !isAutoUpdateEnabled(installDir)) {
+            String msg = "자동 업데이트 꺼짐 (bridge_config.json auto_update_enabled=false, v" + BRIDGE_VERSION + ")";
+            System.out.println("[AutoUpdate] Disabled by config/bridge_config.json");
+            lastAutoUpdateStatus = msg;
+            try { writeBytesAtomic(statusNoteFile, (msg + "\n").getBytes(UTF8)); } catch (Exception ignored) {}
+            return 0;
+        }
         try {
             String baseUrl = "https://raw.githubusercontent.com/" + owner + "/" + repo + "/" + branch;
             String verUrl = baseUrl + "/version.json";
@@ -2498,6 +2530,16 @@ public class CarrotBridgeMain {
             if (remoteVersion.isEmpty()) {
                 System.out.println("[AutoUpdate] Invalid version.json");
                 return 2;
+            }
+
+            // Never downgrade: the updater used to replace the jar AND scripts/configs on any version mismatch,
+            // so a newer local build (e.g. a USB-installed fork build) was overwritten by an older repo manifest.
+            if (compareVersions(remoteVersion, BRIDGE_VERSION) < 0) {
+                String msg = "현재 v" + BRIDGE_VERSION + " 유지 (저장소 v" + remoteVersion + "가 더 낮음, " + nowStr + ")";
+                System.out.println("[AutoUpdate] Remote " + remoteVersion + " is older than running " + BRIDGE_VERSION + "; skip (no downgrade).");
+                lastAutoUpdateStatus = msg;
+                try { writeBytesAtomic(statusNoteFile, (msg + "\n").getBytes(UTF8)); } catch (Exception ignored) {}
+                return 0;
             }
 
             File localVerFile = new File(installDir, "version.json");
@@ -4072,6 +4114,11 @@ public class CarrotBridgeMain {
             if (mapTurnDirectionToCarrot(1912.5) != -1) throw new AssertionError("1912.5 sentinel must be invalid");
         } finally {
             clockOverrideMs = -1L;
+        }
+
+        // 1g. Updater must never downgrade
+        if (compareVersions("1.2.6", "1.2.7") >= 0 || compareVersions("1.2.10", "1.2.9") <= 0 || compareVersions("1.2.7", "1.2.7") != 0) {
+            throw new AssertionError("compareVersions mismatch");
         }
 
         // 2. Test Section Control + Average Speed (SCC_HU_Navi_P)
