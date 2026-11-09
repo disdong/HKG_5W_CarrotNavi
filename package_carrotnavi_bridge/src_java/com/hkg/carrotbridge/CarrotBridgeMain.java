@@ -2496,28 +2496,9 @@ public class CarrotBridgeMain {
         return 0;
     }
 
-    /** Honors "auto_update_enabled": false in the installed config/bridge_config.json (was previously ignored). */
-    static boolean isAutoUpdateEnabled(String installDir) {
-        try {
-            File conf = new File(installDir, "config/bridge_config.json");
-            if (!conf.isFile()) return true;
-            String json = new String(readAllBytes(new FileInputStream(conf)), UTF8);
-            return !Pattern.compile("\"auto_update_enabled\"\\s*:\\s*false").matcher(json).find();
-        } catch (Throwable t) {
-            return true;
-        }
-    }
-
     public static int runAutoUpdate(String owner, String repo, String branch, String installDir, boolean force) {
         String nowStr = new SimpleDateFormat("HH:mm:ss", Locale.US).format(new Date());
         File statusNoteFile = new File(installDir, "config/last_update_status.txt");
-        if (!force && !isAutoUpdateEnabled(installDir)) {
-            String msg = "자동 업데이트 꺼짐 (bridge_config.json auto_update_enabled=false, v" + BRIDGE_VERSION + ")";
-            System.out.println("[AutoUpdate] Disabled by config/bridge_config.json");
-            lastAutoUpdateStatus = msg;
-            try { writeBytesAtomic(statusNoteFile, (msg + "\n").getBytes(UTF8)); } catch (Exception ignored) {}
-            return 0;
-        }
         try {
             String baseUrl = "https://raw.githubusercontent.com/" + owner + "/" + repo + "/" + branch;
             String verUrl = baseUrl + "/version.json";
@@ -2724,6 +2705,7 @@ public class CarrotBridgeMain {
         private static volatile Object headerSysInfoTextView = null;
         private static volatile Object leftColTextView = null;
         private static volatile Object autoHotspotCheckTextView = null;
+        private static volatile Object autoWifiCheckTextView = null;
         private static volatile Object rightColTextView = null;
         private static volatile Object commaTxCheckTextView = null;
         private static volatile Object footerStatusTextView = null;
@@ -2997,6 +2979,21 @@ public class CarrotBridgeMain {
             setMargins(autoHsCheckLp, 0, 10, 0, 0);
             vgCls.getMethod("addView", viewCls, vgLpCls).invoke(leftCard, autoHsCheckTv, autoHsCheckLp);
 
+            // Interactive Checkbox for Wi-Fi client (STA) auto-on at ignition (ON/OFF)
+            Object autoWifiCheckTv = tvCtor.newInstance(sysContext);
+            styleAutoWifiCheckbox(autoWifiCheckTv, isAutoWifiClientEnabled());
+            tvSetGravity.invoke(autoWifiCheckTv, 17); // CENTER
+            viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(autoWifiCheckTv, 12, 8, 12, 8);
+            attachClickListener(autoWifiCheckTv, new Runnable() {
+                @Override
+                public void run() {
+                    toggleAutoWifiClientFromUi();
+                }
+            });
+            Object autoWifiCheckLp = llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT);
+            setMargins(autoWifiCheckLp, 0, 10, 0, 0);
+            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(leftCard, autoWifiCheckTv, autoWifiCheckLp);
+
             Object leftCardLp = llLpCtor3.newInstance(0, MATCH_PARENT, 1.0f);
             setMargins(leftCardLp, 0, 0, 8, 0);
             vgCls.getMethod("addView", viewCls, vgLpCls).invoke(bodyRow, leftCard, leftCardLp);
@@ -3132,7 +3129,7 @@ public class CarrotBridgeMain {
             tvCls.getMethod("setGravity", int.class).invoke(footerTv, 17); // CENTER
             vgCls.getMethod("addView", viewCls, vgLpCls).invoke(root, footerTv, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
 
-            return new Object[]{root, leftTv, rightTv, footerTv, sysInfoTv, autoHsCheckTv, commaTxCheckTv};
+            return new Object[]{root, leftTv, rightTv, footerTv, sysInfoTv, autoHsCheckTv, commaTxCheckTv, autoWifiCheckTv};
         }
 
         private static void showOnUiThread() {
@@ -3195,6 +3192,7 @@ public class CarrotBridgeMain {
                         headerSysInfoTextView = tree.length > 4 ? tree[4] : null;
                         autoHotspotCheckTextView = tree.length > 5 ? tree[5] : null;
                         commaTxCheckTextView = tree.length > 6 ? tree[6] : null;
+                        autoWifiCheckTextView = tree.length > 7 ? tree[7] : null;
                         isVisible = true;
                         shownAtMs = System.currentTimeMillis();
                         System.out.println("[CarrotBridge] StatusDashboardOverlay displayed (windowType=" + wtype + ")");
@@ -3222,6 +3220,7 @@ public class CarrotBridgeMain {
             headerSysInfoTextView = null;
             leftColTextView = null;
             autoHotspotCheckTextView = null;
+            autoWifiCheckTextView = null;
             rightColTextView = null;
             commaTxCheckTextView = null;
             footerStatusTextView = null;
@@ -3337,6 +3336,9 @@ public class CarrotBridgeMain {
                 if (autoHotspotCheckTextView != null) {
                     styleAutoHotspotCheckbox(autoHotspotCheckTextView, isBootAutoHotspotEnabled());
                 }
+                if (autoWifiCheckTextView != null) {
+                    styleAutoWifiCheckbox(autoWifiCheckTextView, isAutoWifiClientEnabled());
+                }
                 if (commaTxCheckTextView != null) {
                     styleCommaTxCheckbox(commaTxCheckTextView, commaTxEnabled);
                 }
@@ -3403,6 +3405,61 @@ public class CarrotBridgeMain {
                     postToUi(REFRESH_TASK);
                 }
             }, "ToggleBootAutoHotspot").start();
+        }
+
+        /** config/wifi_auto.conf: "1" = turn the Wi-Fi client (STA) on at ignition. Default OFF. Read by bridge-daemon.sh. */
+        private static boolean isAutoWifiClientEnabled() {
+            try {
+                File conf = new File(installDir, "config/wifi_auto.conf");
+                if (conf.isFile()) {
+                    return "1".equals(readFirstLineQuick(conf));
+                }
+            } catch (Throwable ignored) {
+            }
+            return false;
+        }
+
+        private static void styleAutoWifiCheckbox(Object view, boolean enabled) throws Exception {
+            if (enabled) {
+                setTextViewStyle(view, "☑ 시동 시 Wi-Fi(스마트폰 핫스팟 수신) 자동 켜기 : ON (터치하여 변경)", 14.5f, 0xFFFFFFFF, true);
+                setRoundedBg(view, 0xFF065F46, 0xFF34D399, 2, 10f);
+            } else {
+                setTextViewStyle(view, "☐ 시동 시 Wi-Fi(스마트폰 핫스팟 수신) 자동 켜기 : OFF (터치하여 변경)", 14.5f, 0xFFCBD5E1, true);
+                setRoundedBg(view, 0xFF334155, 0xFF64748B, 2, 10f);
+            }
+        }
+
+        private static void toggleAutoWifiClientFromUi() {
+            final boolean nextState = !isAutoWifiClientEnabled();
+            try {
+                File conf = new File(installDir, "config/wifi_auto.conf");
+                writeBytesAtomic(conf, (nextState ? "1\n" : "0\n").getBytes(UTF8));
+            } catch (Throwable ignored) {
+            }
+            final boolean hotspotAutoOn = isBootAutoHotspotEnabled();
+            if (!nextState) {
+                actionBannerMsg = "ℹ️ 시동 시 Wi-Fi 자동 켜기가 [OFF]로 해제되었습니다.";
+            } else if (hotspotAutoOn) {
+                actionBannerMsg = "⚠️ Wi-Fi 자동 켜기 [ON] 저장. 단, '부팅 시 핫스팟 자동 활성화'가 ON이면 핫스팟이 우선이라 동작하지 않습니다.";
+            } else {
+                actionBannerMsg = "✅ 시동 시 Wi-Fi 자동 켜기가 [ON]으로 설정되었습니다. (지금 Wi-Fi 켜는 중)";
+            }
+            postToUi(REFRESH_TASK);
+            if (nextState && !hotspotAutoOn) {
+                new Thread(new Runnable() {
+                    @Override
+                    public void run() {
+                        try {
+                            String st = execCommandCapture(new String[]{"/system/bin/service", "call", "wifi", "14"}, 5);
+                            if (st == null || !(st.contains("00000002") || st.contains("00000003"))) {
+                                execCommandCapture(new String[]{"/system/bin/service", "call", "wifi", "13", "i32", "1"}, 10);
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                        postToUi(REFRESH_TASK);
+                    }
+                }, "ToggleAutoWifiClient").start();
+            }
         }
 
         private static void styleCommaTxCheckbox(Object view, boolean enabled) throws Exception {

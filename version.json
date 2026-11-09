@@ -7,7 +7,7 @@
   "files": {
     "svc/bridge-daemon.sh": {
       "remote": "package_carrotnavi_bridge/svc/bridge-daemon.sh",
-      "sha256": "feaa0cef38871ef736b4eee9587e9c0df4cd3dedc2eedfaf81c5adfcef429e0d"
+      "sha256": "63b0a916c0c2f30c0d60a57b233a6d34994bb322f782afb84679b6de096aed39"
     },
     "bin/launch.sh": {
       "remote": "package_carrotnavi_bridge/bin/launch.sh",
