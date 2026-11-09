@@ -157,11 +157,11 @@ check_bridge_java_watchdog() {
 }
 
 run_github_update_check() {
-    log_info "Triggering GitHub Auto-Update check (GRT47/HKG_5W_CarrotNavi)..."
+    log_info "Triggering GitHub Auto-Update check (disdong/HKG_5W_CarrotNavi)..."
     if [ -n "$BRIDGE_PID" ] && kill -0 "$BRIDGE_PID" 2>/dev/null; then
         echo 1 > /data/local/tmp/carrotbridge_check_update 2>/dev/null
     else
-        CLASSPATH="$INSTALL_DIR/bin/carrotbridge.jar" /system/bin/app_process /system/bin com.hkg.carrotbridge.CarrotBridgeMain update GRT47 HKG_5W_CarrotNavi main "$INSTALL_DIR" 2>&1
+        CLASSPATH="$INSTALL_DIR/bin/carrotbridge.jar" /system/bin/app_process /system/bin com.hkg.carrotbridge.CarrotBridgeMain update disdong HKG_5W_CarrotNavi main "$INSTALL_DIR" 2>&1
     fi
 }
 
