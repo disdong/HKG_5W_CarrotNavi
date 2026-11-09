@@ -35,22 +35,37 @@ ip addr flush dev eth0 >/dev/null 2>&1
 ip link set eth0 down >/dev/null 2>&1
 ifconfig eth0 0.0.0.0 down >/dev/null 2>&1
 
-# 2. Enable Auto-Hotspot properties (Hotspot Activation = on, Hotspot APN = Public)
-setprop persist.sys.hotspot.auto 1
-setprop wifi.hotspot.subscription true
-setprop wifi.hotspot.apn Public
-
-# 3. Disable STA Wi-Fi client if active, then enable SoftAP (tx 29 = setWifiApEnabled(null, true))
-wifi_state="$(service call wifi 14 2>/dev/null)"
-case "$wifi_state" in
-    *00000002*|*00000003*)
-        service call wifi 13 i32 0 >/dev/null 2>&1
-        sleep 1
-        ;;
+# 2./3. Auto-Hotspot: respect the user's existing choice.
+#   persist.sys.hotspot.auto survives package uninstall/update. If it is "0" the head unit is deliberately used as a
+#   Wi-Fi CLIENT (e.g. joined to a phone hotspot together with the comma device), so do NOT turn the STA off or start
+#   SoftAP. Only a unit that has never chosen (empty prop) gets the old default (auto-hotspot ON).
+HS_AUTO="$(getprop persist.sys.hotspot.auto)"
+if [ -z "$HS_AUTO" ]; then
+    HS_AUTO=1
+    setprop persist.sys.hotspot.auto 1
+fi
+mkdir -p "$INSTALL_DIR/config" 2>/dev/null
+case "$HS_AUTO" in
+    0) echo "0" > "$INSTALL_DIR/config/hotspot_auto.conf" 2>/dev/null ;;
+    *) echo "1" > "$INSTALL_DIR/config/hotspot_auto.conf" 2>/dev/null ;;
 esac
-service call wifi 29 i32 0 i32 1 >/dev/null 2>&1
-settings put global wifi_ap_on 1 >/dev/null 2>&1
-am startservice -n com.hkmc.wifisettings/.service.HotspotService >/dev/null 2>&1
+
+if [ "$HS_AUTO" != "0" ]; then
+    setprop wifi.hotspot.subscription true
+    setprop wifi.hotspot.apn Public
+
+    # Disable STA Wi-Fi client if active, then enable SoftAP (tx 29 = setWifiApEnabled(null, true))
+    wifi_state="$(service call wifi 14 2>/dev/null)"
+    case "$wifi_state" in
+        *00000002*|*00000003*)
+            service call wifi 13 i32 0 >/dev/null 2>&1
+            sleep 1
+            ;;
+    esac
+    service call wifi 29 i32 0 i32 1 >/dev/null 2>&1
+    settings put global wifi_ap_on 1 >/dev/null 2>&1
+    am startservice -n com.hkmc.wifisettings/.service.HotspotService >/dev/null 2>&1
+fi
 
 # 4. Wake up com.mnsoft.navi [Cluster] plain-text TBT logger (intArray[14] == 0 -> gq=false)
 am broadcast -a com.android.Eng.LogSetting --eia intArray 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0 >/dev/null 2>&1
