@@ -68,7 +68,7 @@ public class CarrotBridgeMain {
 
     private static final int CARROT_BROADCAST_PORT = 7705;
     private static final int CARROT_TARGET_PORT = 7706;
-    private static final long TRACE_MAX_BYTES = 4L * 1024L * 1024L; // 4 MB cap with rotation
+    private static final long TRACE_MAX_BYTES = 16L * 1024L * 1024L; // 16 MB cap with rotation (x2 with .old = 32 MB, ~70 min of guidance)
 
     /**
      * Thread-safe navigation state model aggregated from logcat + dumpsys.
@@ -1955,6 +1955,7 @@ public class CarrotBridgeMain {
         final File dumpDir = new File("/data/local/tmp/hkg_tbt_dump");
         if (!dumpDir.exists()) dumpDir.mkdirs();
         final File traceFile = new File(dumpDir, "tbt_live_trace.log");
+        NewCodeRecorder.init(dumpDir);
         final File statusFile = new File("/data/local/tmp/carrotbridge_status.json");
         final File showUiTriggerFile = new File("/data/local/tmp/carrotbridge_show_ui");
         final File checkUpdateTriggerFile = new File("/data/local/tmp/carrotbridge_check_update");
@@ -2035,6 +2036,7 @@ public class CarrotBridgeMain {
                                 }
                             }
                             parseLogcatLine(line, navState, traceFile);
+                            NewCodeRecorder.onLogLine(line, navState);
                         }
                     } catch (Exception e) {
                         try { Thread.sleep(1000L); } catch (InterruptedException ignored) {}
@@ -2694,6 +2696,186 @@ public class CarrotBridgeMain {
     // =========================================================================
     // MAP BUTTON 3-PRESS STATUS DASHBOARD OVERLAY UI (Android 4.4.2 System UI)
     // =========================================================================
+
+    /**
+     * Collects navi guidance codes never seen before on this head unit into tbt_new_codes.log (same dump dir, so it is
+     * exported to USB together with tbt_live_trace.log). Keys already seen are kept in tbt_seen_codes.txt across reboots,
+     * so ordinary driving only adds an entry when the navi emits something new.
+     *   - 0x4E TBT Info: DisplayType + Direction (Direction omitted for 0x8 compass, where it is just the heading)
+     *   - 0x4B Trap Info: categorical fields (WarningZone, NonSpeed, speed info type, Curve/Merge warning, DisplayTG, bus type)
+     * Each entry records the full 0x4E group, crossroad name, remaining distance, what the bridge sends for it, the
+     * preceding guidance code, the last 40 navi log lines, the next 10 navi lines (the crossroad name usually arrives
+     * after the 0x4E group), and the next 2 guidance codes that follow it.
+     * Independent of the parser: it only reads the raw logcat lines.
+     */
+    public static final class NewCodeRecorder {
+        private static final long MAX_LOG_BYTES = 2L * 1024L * 1024L;
+        private static final int RING_SIZE = 40;
+        private static final String[] TRAP_FIELDS = {
+                "WarningZone", "NonSpeed", "speed info type(int)", "CurveWarning", "MergeWarning", "DisplayTG",
+                "bus speed type(int)", "strBusSpdType"
+        };
+        private static File logFile;
+        private static File seenFile;
+        private static final Set<String> seen = new LinkedHashSet<String>();
+        private static final String[] ring = new String[RING_SIZE];
+        private static int ringPos = 0;
+        private static int ringCount = 0;
+        private static final Map<String, String> group = new LinkedHashMap<String, String>();
+        private static String lastGuideKey = "";
+        private static int followUps = 0;
+        private static int postLines = 0;   // navi lines still to append after the latest NEW entry
+
+        public static synchronized void init(File dumpDir) {
+            logFile = new File(dumpDir, "tbt_new_codes.log");
+            seenFile = new File(dumpDir, "tbt_seen_codes.txt");
+            seen.clear();
+            try {
+                if (seenFile.isFile()) {
+                    BufferedReader br = new BufferedReader(new InputStreamReader(new FileInputStream(seenFile), UTF8));
+                    try {
+                        String l;
+                        while ((l = br.readLine()) != null) {
+                            l = l.trim();
+                            if (!l.isEmpty()) seen.add(l);
+                        }
+                    } finally {
+                        br.close();
+                    }
+                }
+            } catch (Exception ignored) {
+            }
+        }
+
+        public static synchronized void onLogLine(String line, NavState st) {
+            if (logFile == null || line == null) return;
+            if (!(line.contains("[IL TBT") || line.contains("[TP ") || line.contains("updateTBT")
+                    || line.contains("GuidStatus") || line.contains("updateTPCrossroadName"))) {
+                return;
+            }
+            if (line.contains("=====")) return;
+            // post-context skips the bulky 0x4B trap / 0x4D sub-info blocks so the crossroad name is not crowded out
+            if (postLines > 0 && !line.contains("[IL TBT Trap Info") && !line.contains("[IL TBT Sub Info")
+                    && !line.contains("updateTBTSubInfo")) {
+                appendRaw("    + " + clock() + " " + line + "\n");
+                postLines--;
+            }
+            ring[ringPos] = clock() + " " + line;
+            ringPos = (ringPos + 1) % RING_SIZE;
+            if (ringCount < RING_SIZE) ringCount++;
+
+            int idx = line.indexOf("[IL TBT Info - 0x4E] ");
+            if (idx >= 0) {
+                String kv = line.substring(idx + "[IL TBT Info - 0x4E] ".length());
+                int eq = kv.indexOf(" = ");
+                if (eq <= 0) return;
+                String k = kv.substring(0, eq).trim();
+                String v = kv.substring(eq + 3).trim();
+                if ("DisplayType".equals(k)) group.clear();
+                group.put(k, v);
+                if ("CombiSideStreet".equals(k) && group.containsKey("DisplayType")) {
+                    onGuideGroup(st);
+                }
+                return;
+            }
+            idx = line.indexOf("[IL TBT Trap Info - 0x4B] ");
+            if (idx >= 0) {
+                String kv = line.substring(idx + "[IL TBT Trap Info - 0x4B] ".length());
+                int eq = kv.indexOf(" = ");
+                if (eq <= 0) return;
+                String k = kv.substring(0, eq).trim();
+                String v = kv.substring(eq + 3).trim();
+                for (String f : TRAP_FIELDS) {
+                    if (f.equals(k)) {
+                        String key = "0x4B " + k + "=" + v;
+                        if (!seen.contains(key)) record(key, st, "단속/안전 정보 코드");
+                        break;
+                    }
+                }
+            }
+        }
+
+        private static void onGuideGroup(NavState st) {
+            String dt = group.get("DisplayType");
+            String dir = group.containsKey("Direction") ? group.get("Direction") : "?";
+            boolean compass = "0x8".equalsIgnoreCase(dt) || "8".equals(dt);
+            String key = "0x4E DisplayType=" + dt + (compass ? "" : " Direction=" + dir);
+            if (key.equals(lastGuideKey)) return;
+            if (followUps > 0 && !seen.contains(key)) {
+                // the follow-up itself is new: it gets its own entry below
+            } else if (followUps > 0) {
+                appendRaw("    → 이후 안내: " + key + " | Distance=" + group.get("Distance")
+                        + " | BarGraph=" + group.get("BarGraphLevel") + " | 교차로명=" + crossName(st) + "\n");
+                followUps--;
+            }
+            String prevKey = lastGuideKey;
+            lastGuideKey = key;
+            if (!seen.contains(key)) {
+                record(key, st, "주행안내(TBT) 코드, 직전 안내: " + (prevKey.isEmpty() ? "-" : prevKey));
+                followUps = 2;
+            }
+        }
+
+        private static void record(String key, NavState st, String kind) {
+            if (logFile.exists() && logFile.length() > MAX_LOG_BYTES) return; // full: leave unseen so it is caught after cleanup
+            StringBuilder sb = new StringBuilder(4096);
+            sb.append("\n######## NEW ").append(clock()).append("  ").append(key).append('\n');
+            sb.append("  종류: ").append(kind).append('\n');
+            if (!group.isEmpty()) sb.append("  0x4E 현재값: ").append(group).append('\n');
+            int bridgeTurn;
+            int remain;
+            synchronized (st) {
+                bridgeTurn = mapHkmcToCarrotTurnType(st.displayTypeCode, st.tbtDirectionDeg, st.sccNextTurnType1, st.displayTG, st.tollGateFee);
+                remain = st.remainDistM;
+            }
+            sb.append("  교차로명: ").append(crossName(st)).append(" | 목적지까지: ").append(remain).append("m")
+                    .append(" | 브릿지 전송 nTBTTurnType: ").append(bridgeTurn).append('\n');
+            sb.append("  직전 로그 ").append(ringCount).append("줄:\n");
+            for (int i = 0; i < ringCount; i++) {
+                String l = ring[(ringPos - ringCount + i + RING_SIZE) % RING_SIZE];
+                if (l != null) sb.append("    ").append(l).append('\n');
+            }
+            sb.append("  이후 로그 (교차로명은 보통 안내 코드 뒤에 옴):\n");
+            appendRaw(sb.toString());
+            postLines = 10;
+            seen.add(key);
+            try {
+                FileOutputStream fos = new FileOutputStream(seenFile, true);
+                try {
+                    fos.write((key + "\n").getBytes(UTF8));
+                } finally {
+                    fos.close();
+                }
+            } catch (Exception ignored) {
+            }
+        }
+
+        private static String crossName(NavState st) {
+            synchronized (st) {
+                return st.crossroadName == null || st.crossroadName.isEmpty() ? "-" : st.crossroadName;
+            }
+        }
+
+        private static void appendRaw(String text) {
+            try {
+                File parent = logFile.getParentFile();
+                if (parent != null && !parent.exists()) parent.mkdirs();
+                FileOutputStream fos = new FileOutputStream(logFile, true);
+                try {
+                    fos.write(text.getBytes(UTF8));
+                } finally {
+                    fos.close();
+                }
+            } catch (Exception ignored) {
+            }
+        }
+
+        private static String clock() {
+            SimpleDateFormat f = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US);
+            f.setTimeZone(TimeZone.getTimeZone("Asia/Seoul"));
+            return f.format(new Date(nowMs()));
+        }
+    }
 
     public static final class StatusDashboardOverlay {
         private static volatile String installDir = "/data/nemesis/apps/carrotnavi.bridge";
@@ -4176,6 +4358,35 @@ public class CarrotBridgeMain {
         // 1g. Updater must never downgrade
         if (compareVersions("1.2.6", "1.2.7") >= 0 || compareVersions("1.2.10", "1.2.9") <= 0 || compareVersions("1.2.7", "1.2.7") != 0) {
             throw new AssertionError("compareVersions mismatch");
+        }
+
+        // 1h. NewCodeRecorder: a code is written once, remembered across restarts, and followed by post-context lines
+        File recDir = new File(System.getProperty("java.io.tmpdir"), "carrotbridge_selftest_" + System.nanoTime());
+        try {
+            NavState rs = new NavState();
+            String[] grp = {
+                    "I/Java_Layer( 1242): [Cluster] [IL TBT Info - 0x4E] DisplayType = 0xb2",
+                    "I/Java_Layer( 1242): [Cluster] [IL TBT Info - 0x4E] Direction = 1912.5",
+                    "I/Java_Layer( 1242): [Cluster] [IL TBT Info - 0x4E] Distance = 500.0 m",
+                    "I/Java_Layer( 1242): [Cluster] [IL TBT Info - 0x4E] BarGraphLevel = 50%",
+                    "I/Java_Layer( 1242): [Cluster] [IL TBT Info - 0x4E] SideStreet = 0x0 (0)",
+                    "I/Java_Layer( 1242): [Cluster] [IL TBT Info - 0x4E] CombiSideStreet = 0x0 (0)",
+                    "I/Java_Layer( 1242): [Cluster] [TP Crossroad Name - 0x4F(0xF0)] Crossroad Name = 서호학산톨게이트"
+            };
+            NewCodeRecorder.init(recDir);
+            for (String l : grp) NewCodeRecorder.onLogLine(l, rs);
+            for (String l : grp) NewCodeRecorder.onLogLine(l, rs);
+            NewCodeRecorder.init(recDir); // simulate daemon restart
+            for (String l : grp) NewCodeRecorder.onLogLine(l, rs);
+            String recLog = new String(readAllBytes(new FileInputStream(new File(recDir, "tbt_new_codes.log"))), UTF8);
+            int n = recLog.split("NEW .{19}  0x4E DisplayType=0xb2 Direction=1912.5", -1).length - 1;
+            if (n != 1 || !recLog.contains("서호학산톨게이트")) {
+                throw new AssertionError("NewCodeRecorder: expected exactly one 0xb2 entry with post-context crossroad name, got " + n);
+            }
+        } finally {
+            File[] fs = recDir.listFiles();
+            if (fs != null) for (File f : fs) f.delete();
+            recDir.delete();
         }
 
         // 2. Test Section Control + Average Speed (SCC_HU_Navi_P)
