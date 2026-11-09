@@ -1,13 +1,13 @@
 {
-  "version": "1.2.6",
-  "repository": "https://github.com/GRT47/HKG_5W_CarrotNavi.git",
+  "version": "1.2.7",
+  "repository": "https://github.com/disdong/HKG_5W_CarrotNavi.git",
   "branch": "main",
-  "release_jar_url": "https://github.com/GRT47/HKG_5W_CarrotNavi/releases/latest/download/carrotbridge.jar",
-  "release_jar_sha256_url": "https://github.com/GRT47/HKG_5W_CarrotNavi/releases/latest/download/carrotbridge.jar.sha256",
+  "release_jar_url": "https://github.com/disdong/HKG_5W_CarrotNavi/releases/latest/download/carrotbridge.jar",
+  "release_jar_sha256_url": "https://github.com/disdong/HKG_5W_CarrotNavi/releases/latest/download/carrotbridge.jar.sha256",
   "files": {
     "svc/bridge-daemon.sh": {
       "remote": "package_carrotnavi_bridge/svc/bridge-daemon.sh",
-      "sha256": "bc6d45e72ed1b1e88350be663e4eb81a6502db5aa4eb95a88c2c348fa810e8b7"
+      "sha256": "63b0a916c0c2f30c0d60a57b233a6d34994bb322f782afb84679b6de096aed39"
     },
     "bin/launch.sh": {
       "remote": "package_carrotnavi_bridge/bin/launch.sh",
@@ -19,7 +19,7 @@
     },
     "config/bridge_config.json": {
       "remote": "package_carrotnavi_bridge/config/bridge_config.json",
-      "sha256": "b57247ad727f8d8653a6004f0c51eeef7622d8431a110663481378ee0207285b"
+      "sha256": "2f53f2a364deb06522f69b38e787c3c319d3306cd3dbd0d295fc222e81d1c7d8"
     }
   }
 }

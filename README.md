@@ -48,3 +48,49 @@ python package_carrotnavi_bridge/build_package.py
 python package_engineering_wifiinfo/build_package.py
 ```
 
+---
+
+## Gen5W 확장 DisplayType / 회전 각도 매핑 (v1.2.7, K7 PE 실주행 검증)
+
+2026-11-08 K7 PE(`wp_daudioplus_ygpe_kr`) 퇴근길 덤프(서호학산TG → 고속도로 → 남악IC → 시내 → 목적지)에서 확인한 값입니다.
+
+| 순정 0x4E DisplayType | 실제 의미 (덤프 근거) | CarrotPilot `nTBTTurnType` |
+|---|---|---|
+| `0xd` + Direction `22.5` | 완만한 우측 (TG 진입로, 고속도로 출구) | `6` (fork right, 도로 제한속도 유지) |
+| `0xd` + Direction `90` / `270` | 우회전 / 좌회전 | `13` / `12` |
+| `0x42` | 직진 유지, 고속도로 (다음 안내까지 13.5km 카운트다운) | `51` |
+| `0x46` | 직진 유지, 일반도로 | `51` |
+| `0xB2` | 요금소 (교차로명 = "서호학산톨게이트", 500m 카운트다운) | `153` |
+| `0x71` | 목적지 부근 (200m 카운트다운 → `0x3` ARRIVED) | `201` |
+| 그 외 미확인 코드 | — | `51` (감속 유발 금지) |
+
+Direction은 22.5° 단위입니다: `0` 직진, `22.5` 완만한 우측, `45~112.5` 우회전, `135~157.5` 급우회전, `180` 유턴, `202.5~225` 급좌회전, `247.5~315` 좌회전, `337.5` 완만한 좌측, `1912.5` 무효.
+
+그 외 수정:
+- dumpsys `TBT SubInfo`의 손상값(`18.5 METER` = 실제 km, `minutes = 12` = 도착예정시각의 분)이 로그캣 값을 덮어써서 `nGoPosDist`/`nGoPosTime`이 매 패킷 튀던 문제 → 로그캣 값이 15초 이내로 신선하면 dumpsys 무시
+- dumpsys `Unknown display type(0x42)` 문자열이 `szTBTMainText`로 그대로 전송되던 문제 → 16진 코드 해석 + 한글 라벨
+- dumpsys 무효 거리 `65535.15 unknown scale(0x0f)` 필터링
+- 자동 업데이트 대상을 `disdong/HKG_5W_CarrotNavi`로 변경 (원본 1.2.6으로 덮어쓰기 방지)
+- 자동 업데이트가 저장소 버전이 더 낮으면 건너뜀 (다운그레이드 방지)
+- 대시보드 메뉴에 **`시동 시 Wi-Fi(스마트폰 핫스팟 수신) 자동 켜기`** 체크박스 추가 (`config/wifi_auto.conf`, 기본 OFF). 시동(콜드부트·ACC ON 화면 켜짐) 때 Wi-Fi 클라이언트를 켜서 저장된 스마트폰 핫스팟에 자동 접속. 차량 핫스팟과 동시 사용이 불가능해서 `부팅 시 핫스팟 자동 활성화`가 ON이면 동작하지 않음
+
+### TBT 덤프 (v1.2.7)
+
+`/data/local/tmp/hkg_tbt_dump/` (USB 꽂으면 `HKG_TBT_Dump/`로 자동 복사)
+
+| 파일 | 내용 |
+|---|---|
+| `tbt_live_trace.log` / `.old` | 전체 실시간 기록. 파일당 16MB, 2개 순환 (약 70분 분량) |
+| `tbt_new_codes.log` | **처음 보는 코드만** 기록 (0x4E DisplayType+Direction, 0x4B 단속/안전 분류값). 항목마다 직전 로그 40줄, 이후 로그 10줄, 다음 안내 2개, 브릿지 전송값 포함. 최대 2MB |
+| `tbt_seen_codes.txt` | 이미 기록한 코드 목록 (재부팅해도 유지). 지우면 처음부터 다시 수집 |
+
+### 실주행 덤프 리플레이 (오프라인 검증)
+
+```bash
+cd package_carrotnavi_bridge
+mkdir -p /tmp/cls
+javac --release 8 -encoding UTF-8 -d /tmp/cls src_java/com/hkg/carrotbridge/CarrotBridgeMain.java tools/com/hkg/carrotbridge/TbtReplay.java
+java -Dfile.encoding=UTF-8 -cp /tmp/cls com.hkg.carrotbridge.TbtReplay tbt_live_trace.log.old tbt_live_trace.log
+```
+
+차에서 기록한 `TX7706` 패킷 시점마다 현재 코드로 패킷을 다시 만들어 TBT 값을 비교하고, SDI/제한속도 값이 기록과 다르면 `SDI DIFF`로 표시합니다.

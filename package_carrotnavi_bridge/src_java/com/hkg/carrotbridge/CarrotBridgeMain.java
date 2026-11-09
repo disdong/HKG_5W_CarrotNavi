@@ -60,7 +60,7 @@ import javax.net.ssl.X509TrustManager;
  */
 public class CarrotBridgeMain {
 
-    public static final String BRIDGE_VERSION = "1.2.6";
+    public static final String BRIDGE_VERSION = "1.2.7";
     private static final Charset UTF8 = Charset.forName("UTF-8");
     private static final Charset UTF16LE = Charset.forName("UTF-16LE");
     private static final Charset UTF16BE = Charset.forName("UTF-16BE");
@@ -68,12 +68,38 @@ public class CarrotBridgeMain {
 
     private static final int CARROT_BROADCAST_PORT = 7705;
     private static final int CARROT_TARGET_PORT = 7706;
-    private static final long TRACE_MAX_BYTES = 4L * 1024L * 1024L; // 4 MB cap with rotation
+    private static final long TRACE_MAX_BYTES = 16L * 1024L * 1024L; // 16 MB cap with rotation (x2 with .old = 32 MB, ~70 min of guidance)
 
     /**
      * Thread-safe navigation state model aggregated from logcat + dumpsys.
      */
+    /**
+     * Clock used by the parsers / mapper. Normally wall-clock; the offline replay tool (tools/TbtReplay)
+     * sets it to the timestamps recorded in tbt_live_trace.log so freshness windows and ETA math match the drive.
+     */
+    static volatile long clockOverrideMs = -1L;
+
+    static long nowMs() {
+        long o = clockOverrideMs;
+        return o >= 0 ? o : System.currentTimeMillis();
+    }
+
+    /**
+     * How long a value parsed from the live logcat ([IL TBT ...] / NaviCluster.update*()) wins over the periodic
+     * dumpsys snapshot. On Gen5W the dumpsys copy is lossy: "TBT SubInfo distance = 18.5 METER" (really km),
+     * "minutes = 12" (the minute part of the 20:12 ETA clock, not a duration), "next 1 = 0.0 DISTANCE NONE".
+     */
+    static final long LOG_FRESH_MS = 15000L;
+
+    /** Internal display code for the Gen5W toll gate guidance (0x4E DisplayType = 0xB2). Not a framework enum value. */
+    static final int DISPLAY_TOLLGATE = 100;
+
     public static final class NavState {
+        // Freshness of the live logcat sources (see LOG_FRESH_MS)
+        public long lastIlSubInfoMs = -1L;   // [IL TBT Sub Info - 0x4D] / updateTBTSubInfo()
+        public long lastSubInfo2Ms = -1L;    // updateTBTSubInfo2C() / [IL TBT Sub Info 2 - 0x4C]
+        public int rawDisplayType = -1;      // last raw 0x4E DisplayType byte (for unknown-code diagnostics)
+
         // Road & Vehicle state
         public int nRoadLimitSpeed = 30;
         public int slifSpeedLimit = 0;
@@ -168,7 +194,7 @@ public class CarrotBridgeMain {
         public String posRoadName = "";
 
         public int carrotIndex = 0;
-        public long lastUpdateMs = System.currentTimeMillis();
+        public long lastUpdateMs = nowMs();
 
         public synchronized boolean isGuidanceActive() {
             if (bGuid || setDestStatus == 1 || operationStatus == 1 || remainDistM > 0) {
@@ -339,7 +365,7 @@ public class CarrotBridgeMain {
         boolean interestingForTrace = false;
 
         synchronized (st) {
-            st.lastUpdateMs = System.currentTimeMillis();
+            st.lastUpdateMs = nowMs();
 
             // 1. NaviCluster.updateTBTTrapInfo()
             if (line.contains("updateTBTTrapInfo()")) {
@@ -366,10 +392,10 @@ public class CarrotBridgeMain {
                 }
                 if (st.fixedSpeed > 0) {
                     st.sectionLatchedSpeed = st.fixedSpeed;
-                    st.lastTrapSpeedMs = System.currentTimeMillis();
+                    st.lastTrapSpeedMs = nowMs();
                 } else if (st.trapSpeedLimit > 0) {
                     st.sectionLatchedSpeed = st.trapSpeedLimit;
-                    st.lastTrapSpeedMs = System.currentTimeMillis();
+                    st.lastTrapSpeedMs = nowMs();
                 }
                 if (st.fixedSpeed == 0 && st.mobileSpeed == 0 && st.redlineSpeed == 0
                         && st.speedInfoType == 0 && st.cameraSafetyAlert == 0
@@ -432,7 +458,7 @@ public class CarrotBridgeMain {
                     st.rangeCamSpdLimit = (rs == 15) ? 0 : normalizeTrapSpeed(rs);
                     if (st.rangeCamSpdLimit > 0) {
                         st.sectionLatchedSpeed = st.rangeCamSpdLimit;
-                        st.lastTrapSpeedMs = System.currentTimeMillis();
+                        st.lastTrapSpeedMs = nowMs();
                     }
                 }
                 if (kv.containsKey("rangeCamAvgMovingSpd")) {
@@ -469,7 +495,7 @@ public class CarrotBridgeMain {
                         st.camWarnDistM = 0;
                     } else {
                         st.camWarnDistM = convertDistToMeters(overDec, underDec, scale, false);
-                        st.lastCamWarnDistMs = System.currentTimeMillis();
+                        st.lastCamWarnDistMs = nowMs();
                     }
                 }
                 if (kv.containsKey("popupInfo") || kv.containsKey("popupDistOverDec")) {
@@ -506,6 +532,7 @@ public class CarrotBridgeMain {
             // 6. NaviCluster.updateTBTSubInfo2C() (unit: 0=m, 1=km, 15=invalid)
             else if (line.contains("updateTBTSubInfo2C()")) {
                 interestingForTrace = true;
+                st.lastSubInfo2Ms = nowMs();
                 Map<String, Integer> kv = extractIntMap(line);
                 int u1 = kv.containsKey("distToPoint1_unit") ? kv.get("distToPoint1_unit") : 15;
                 int i1 = kv.containsKey("distToPoint1_I") ? kv.get("distToPoint1_I") : 0;
@@ -550,6 +577,7 @@ public class CarrotBridgeMain {
             // 9. NavigationCluster: updateTBTSubInfo() distance: 2.7 unit: 1 (0=m, 1=km, 15=invalid)
             else if (line.contains("updateTBTSubInfo()")) {
                 interestingForTrace = true;
+                st.lastIlSubInfoMs = nowMs();
                 double distVal = extractDoubleAfter(line, "distance:");
                 int unit = extractIntAfter(line, "unit:", 15);
                 if (distVal >= 0.0 && unit >= 0 && unit < 15) {
@@ -671,6 +699,7 @@ public class CarrotBridgeMain {
                 }
             }
         } else if (line.contains("[IL TBT Sub Info - 0x4D] Distance To Destination =")) {
+            st.lastIlSubInfoMs = nowMs();
             String val = substringAfter(line, "Distance To Destination =").trim();
             if (val.contains("Invalid") || val.contains("None")) {
                 st.remainDistM = 0;
@@ -684,6 +713,7 @@ public class CarrotBridgeMain {
             int tt = parseIntSafe(val, -1);
             if (tt >= 0) st.subInfoTimeType = tt;
         } else if (line.contains("[IL TBT Sub Info - 0x4D] Time =")) {
+            st.lastIlSubInfoMs = nowMs();
             String val = substringAfter(line, "Time =").trim();
             int colon = val.indexOf(':');
             if (colon > 0) {
@@ -696,9 +726,11 @@ public class CarrotBridgeMain {
             double deg = parseLeadingDouble(val, -1.0);
             if (deg >= 0.0 && deg <= 360.0) st.headingDeg = deg;
         } else if (line.contains("[IL TBT Sub Info 2 - 0x4C] Distance To Next Point 1 =")) {
+            st.lastSubInfo2Ms = nowMs();
             String val = substringAfter(line, "Distance To Next Point 1 =").trim();
             st.subInfo2Dist1M = parseDistanceWithUnitText(val);
         } else if (line.contains("[IL TBT Sub Info 2 - 0x4C] Distance To Next Point 2 =")) {
+            st.lastSubInfo2Ms = nowMs();
             String val = substringAfter(line, "Distance To Next Point 2 =").trim();
             st.subInfo2Dist2M = parseDistanceWithUnitText(val);
         } else if (line.contains("[POSInfo] RangeSpeed =")) {
@@ -713,7 +745,7 @@ public class CarrotBridgeMain {
                 int scale = (st.cam4fScale >= 0 && st.cam4fScale < 15) ? st.cam4fScale : 0;
                 int under = (st.cam4fUnderDec >= 0 && st.cam4fUnderDec < 10) ? st.cam4fUnderDec : 0;
                 st.camWarnDistM = convertDistToMeters(over, under, scale, false);
-                st.lastCamWarnDistMs = System.currentTimeMillis();
+                st.lastCamWarnDistMs = nowMs();
             }
         } else if (line.contains("[IL TBT CamDistance - 0x4F] underDec :")) {
             st.cam4fUnderDec = parseIntSafe(substringAfter(line, "underDec :").trim(), 0);
@@ -724,14 +756,14 @@ public class CarrotBridgeMain {
             } else {
                 int under = (st.cam4fUnderDec >= 0 && st.cam4fUnderDec < 10) ? st.cam4fUnderDec : 0;
                 st.camWarnDistM = convertDistToMeters(st.cam4fOverDec, under, st.cam4fScale, false);
-                st.lastCamWarnDistMs = System.currentTimeMillis();
+                st.lastCamWarnDistMs = nowMs();
             }
         } else if (line.contains("[IL TBT Trap Info - 0x4B] speed Limit(int) =")) {
             int spd = normalizeTrapSpeed(parseIntSafe(substringAfter(line, "speed Limit(int) =").trim(), 0));
             st.trapSpeedLimit = spd;
             if (spd > 0) {
                 st.sectionLatchedSpeed = spd;
-                st.lastTrapSpeedMs = System.currentTimeMillis();
+                st.lastTrapSpeedMs = nowMs();
                 refreshRoadLimitLocked(st);
             }
         } else if (line.contains("[IL TBT Trap Info - 0x4B] speed info type(int) =")) {
@@ -742,7 +774,7 @@ public class CarrotBridgeMain {
             st.fixedSpeed = (val.contains("None") || val.contains("Invalid")) ? 0 : normalizeTrapSpeed(parseIntSafe(val, 0));
             if (st.fixedSpeed > 0) {
                 st.sectionLatchedSpeed = st.fixedSpeed;
-                st.lastTrapSpeedMs = System.currentTimeMillis();
+                st.lastTrapSpeedMs = nowMs();
                 refreshRoadLimitLocked(st);
             }
         } else if (line.contains("[IL TBT Trap Info - 0x4B] MobileSpeed =")) {
@@ -775,7 +807,11 @@ public class CarrotBridgeMain {
         String[] lines = dumpText.split("\n");
 
         synchronized (st) {
-            st.lastUpdateMs = System.currentTimeMillis();
+            st.lastUpdateMs = nowMs();
+            // Gen5W dumpsys SubInfo/SubInfo2 copies are lossy (km printed as METER, ETA minutes as duration,
+            // next-point distances always NONE). Only fall back to them when the live logcat source is silent.
+            final boolean subInfoFromLog = st.lastIlSubInfoMs >= 0 && nowMs() - st.lastIlSubInfoMs < LOG_FRESH_MS;
+            final boolean subInfo2FromLog = st.lastSubInfo2Ms >= 0 && nowMs() - st.lastSubInfo2Ms < LOG_FRESH_MS;
             for (String rawLine : lines) {
                 String line = rawLine.trim();
                 if (line.isEmpty()) continue;
@@ -810,7 +846,7 @@ public class CarrotBridgeMain {
                         st.fixedSpeed = normalizeTrapSpeed(extractKeyInt(line, "Fixed\\s+Speed\\s*=\\s*(-?\\d+)", st.fixedSpeed));
                         if (st.fixedSpeed > 0) {
                             st.sectionLatchedSpeed = st.fixedSpeed;
-                            st.lastTrapSpeedMs = System.currentTimeMillis();
+                            st.lastTrapSpeedMs = nowMs();
                         }
                     }
                     if (line.contains("Redline") && line.contains("Speed")) {
@@ -820,7 +856,7 @@ public class CarrotBridgeMain {
                         st.trapSpeedLimit = normalizeTrapSpeed(extractKeyInt(line, "SpeedLimit\\s*=\\s*(-?\\d+)", st.trapSpeedLimit));
                         if (st.trapSpeedLimit > 0) {
                             st.sectionLatchedSpeed = st.trapSpeedLimit;
-                            st.lastTrapSpeedMs = System.currentTimeMillis();
+                            st.lastTrapSpeedMs = nowMs();
                         }
                     }
                     if (line.contains("SpeedInfoType")) {
@@ -870,7 +906,7 @@ public class CarrotBridgeMain {
                             st.tbtBarGraph = (int) parseLeadingDouble(bg, -1);
                         }
                     }
-                } else if ("SUB1".equals(section)) {
+                } else if ("SUB1".equals(section) && !subInfoFromLog) {
                     if (line.startsWith("distance")) {
                         String[] parts = line.split("\\|");
                         String d = substringAfter(parts[0], "=").trim();
@@ -898,7 +934,7 @@ public class CarrotBridgeMain {
                             st.headingDeg = deg;
                         }
                     }
-                } else if ("SUB2".equals(section)) {
+                } else if ("SUB2".equals(section) && !subInfo2FromLog) {
                     if (line.startsWith("next 1")) {
                         st.subInfo2Dist1M = parseDistanceWithUnitText(substringAfter(line, "=").trim());
                     } else if (line.startsWith("next 2")) {
@@ -923,7 +959,7 @@ public class CarrotBridgeMain {
                         st.rangeCamSpdLimit = (rs == 15) ? 0 : normalizeTrapSpeed(rs);
                         if (st.rangeCamSpdLimit > 0) {
                             st.sectionLatchedSpeed = st.rangeCamSpdLimit;
-                            st.lastTrapSpeedMs = System.currentTimeMillis();
+                            st.lastTrapSpeedMs = nowMs();
                         }
                     }
                     if (line.contains("RangeCamAvgMovingSpd")) {
@@ -968,7 +1004,7 @@ public class CarrotBridgeMain {
         synchronized (st) {
             st.carrotIndex++;
             pkt.carrotIndex = st.carrotIndex;
-            pkt.epochTime = System.currentTimeMillis() / 1000L;
+            pkt.epochTime = nowMs() / 1000L;
             pkt.nRoadLimitSpeed = st.nRoadLimitSpeed > 0 ? st.nRoadLimitSpeed : 30;
             pkt.roadcate = st.roadcate;
 
@@ -989,7 +1025,7 @@ public class CarrotBridgeMain {
                     ? st.rangeCamAvgMovingSpd
                     : ((st.stdPosRangeAvgSpeed > 0 && st.stdPosRangeAvgSpeed < 255) ? st.stdPosRangeAvgSpeed : 0);
 
-            long nowMs = System.currentTimeMillis();
+            long nowMs = nowMs();
             if (st.rangeCamSpdLimit > 0) {
                 st.sectionLatchedSpeed = st.rangeCamSpdLimit;
                 st.lastTrapSpeedMs = nowMs;
@@ -1122,8 +1158,10 @@ public class CarrotBridgeMain {
 
                 pkt.nTBTTurnType = primaryTurn;
                 pkt.nTBTDist = Math.max(0, primaryDist);
+                String turnLabel = describeCarrotTurnShort(primaryTurn);
                 pkt.szTBTMainText = !st.crossroadName.isEmpty() ? st.crossroadName
-                        : (!st.turnListName1.isEmpty() ? st.turnListName1 : st.displayTypeName);
+                        : (!st.turnListName1.isEmpty() ? st.turnListName1
+                        : (!turnLabel.isEmpty() ? turnLabel : st.displayTypeName));
 
                 // Next (2nd) turn
                 int nextTurn = st.sccNextTurnType2 > 0
@@ -1170,6 +1208,8 @@ public class CarrotBridgeMain {
             return 153; // TollGate (xTurnInfo = 6)
         }
         switch (displayType) {
+            case DISPLAY_TOLLGATE:
+                return 153; // TollGate (xTurnInfo = 6, slows only to road limit)
             case 0:
             case 1:
             case 6:
@@ -1197,12 +1237,9 @@ public class CarrotBridgeMain {
             case 15:
             case 16:
             case 34:
-                // TURN: Use Direction angle (0~360 deg, 90=Right, 270=Left, 180=U-turn)
-                if (directionDeg >= 20.0 && directionDeg <= 115.0) return 13; // Turn Right
-                if (directionDeg > 115.0 && directionDeg <= 165.0) return 19; // Sharp Right
-                if (directionDeg > 165.0 && directionDeg < 195.0) return 14;  // U-Turn
-                if (directionDeg >= 195.0 && directionDeg < 245.0) return 16; // Sharp Left
-                if (directionDeg >= 245.0 && directionDeg <= 340.0) return 12; // Turn Left
+                // TURN: Use Direction angle (0~360 deg, 90=Right, 270=Left, 180=U-turn, 22.5/337.5 = slight)
+                int byDir = mapTurnDirectionToCarrot(directionDeg);
+                if (byDir > 0 && byDir != 51) return byDir;
                 if (sccTurnType1 > 0) {
                     int sccMapped = mapSccTurnTypeToCarrot(sccTurnType1);
                     if (sccMapped > 0) return sccMapped;
@@ -1276,21 +1313,105 @@ public class CarrotBridgeMain {
         return (v < 0 || v >= 7) ? 0 : v;
     }
 
+    /**
+     * Gen5W com.mnsoft.navi emits 0x4E DisplayType bytes outside the framework enum (0..46), which ClusterService's
+     * dumpsys prints as "Unknown display type(0xNN)". Identified from a K7 PE (wp_daudioplus_ygpe_kr) drive on
+     * 2026-11-08 (Seoho-Haksan TG -> expressway -> Namak exit -> city -> destination):
+     *   0x42  follow road, expressway (13.5 km countdown to the exit, Direction 1912.5 = none, no bar graph)
+     *   0x43  follow road (seen on earlier drives, kept from v1.2.4)
+     *   0x46  follow road, general road (2.2 km countdown to the next turn after leaving the expressway)
+     *   0xB2  toll gate ahead (500 m countdown with bar graph; crossroad name = "서호학산톨게이트")
+     *   0x71  destination ahead (200 m countdown, Direction 0.0, immediately followed by 0x3 ARRIVED)
+     * Anything else unknown stays "follow road" so it can never trigger turn deceleration on the comma side.
+     */
+    static int mapGen5wExtendedDisplayType(int raw) {
+        switch (raw) {
+            case 0x42:
+            case 0x43:
+            case 0x46:
+                return 11;               // FOLLOW STREET
+            case 0xB2:
+                return DISPLAY_TOLLGATE; // toll gate
+            case 0x71:
+                return 4;                // NEAR DESTINATION
+            default:
+                return 11;
+        }
+    }
+
+    static String describeDisplayCode(int code) {
+        switch (code) {
+            case 0: return "NO SYMBOL";
+            case 1: return "NO INFO";
+            case 3: return "도착";
+            case 4: case 5: return "목적지 부근";
+            case 8: return "NO ROUTE GUIDANCE(COMPASS)";
+            case 9: return "CALC ROUTE";
+            case 10: return "RECALC ROUTE";
+            case 2: case 11: return "직진 주행";
+            case DISPLAY_TOLLGATE: return "요금소";
+            default: return "TBT " + code;
+        }
+    }
+
+    /** Korean fallback for szTBTMainText when the navi gives no crossroad / direction name. */
+    static String describeCarrotTurnShort(int turnType) {
+        switch (turnType) {
+            case 12: return "좌회전";
+            case 13: return "우회전";
+            case 14: return "유턴";
+            case 16: return "급좌회전";
+            case 19: return "급우회전";
+            case 6: case 43: return "우측 방향";
+            case 7: case 44: return "좌측 방향";
+            case 101: return "우측 출구";
+            case 102: return "좌측 출구";
+            case 131: return "회전교차로";
+            case 153: return "요금소";
+            case 201: return "목적지";
+            case 51: return "직진 주행";
+            default: return "";
+        }
+    }
+
+    /**
+     * 0x4E Direction for TURN-type displays: 0 = straight ahead, 90 = right, 180 = back, 270 = left, in 22.5 deg steps.
+     * Real K7 drive: expressway exit (Namak) and the TG approach ramp are sent as TURN with Direction = 22.5.
+     * Those are slight/keep-right maneuvers taken at road speed and must NOT become a 90 deg turn (13), because
+     * CarrotPilot's xTurnInfo=2 slows to AutoTurnControlSpeedTurn. They map to fork right (6 -> xTurnInfo 4, road speed).
+     * Returns -1 when the direction is invalid (e.g. the 1912.5 sentinel).
+     */
+    static int mapTurnDirectionToCarrot(double d) {
+        if (d < 0.0 || d > 360.0) return -1;
+        if (d < 11.25 || d > 348.75) return 51;   // straight ahead
+        if (d < 33.75) return 6;                  // slight right (22.5)
+        if (d < 123.75) return 13;                // right (45 .. 112.5)
+        if (d < 168.75) return 19;                // sharp right (135, 157.5)
+        if (d <= 191.25) return 14;               // U-turn (180)
+        if (d <= 236.25) return 16;               // sharp left (202.5, 225)
+        if (d <= 326.25) return 12;               // left (247.5 .. 315)
+        return 7;                                 // slight left (337.5)
+    }
+
     private static void applyDisplayTypeStringLocked(NavState st, String raw) {
         if (raw == null || raw.isEmpty()) return;
         st.displayTypeName = raw;
         String u = raw.toUpperCase(Locale.US);
-        // Check if raw is an integer code
+        // Check if raw is an integer code. Logcat prints "0xd"; dumpsys prints "Unknown display type(0x42)".
         int numeric = parseIntSafe(u, -1);
+        if (numeric < 0 && u.startsWith("UNKNOWN DISPLAY TYPE")) {
+            Matcher mHex = Pattern.compile("0X([0-9A-F]+)").matcher(u);
+            if (mHex.find()) numeric = parseIntSafe("0x" + mHex.group(1), -1);
+        }
+        if (numeric >= 0) st.rawDisplayType = numeric;
         if (numeric >= 0 && numeric <= 46) {
             st.displayTypeCode = numeric;
+            st.displayTypeName = describeDisplayCode(numeric);
             return;
         }
-        if (numeric == 0x43 || numeric > 46) {
-            // In Gen5W com.mnsoft.navi [IL TBT Info - 0x4E], DisplayType = 0x43 (67) is emitted during
-            // straight road-following guidance (>300m before the next turn). Map to 11 (FOLLOW STREET / 직진).
-            st.displayTypeCode = 11;
-            st.displayTypeName = "직진 주행";
+        if (numeric > 46) {
+            st.displayTypeCode = mapGen5wExtendedDisplayType(numeric);
+            st.displayTypeName = describeDisplayCode(st.displayTypeCode);
             return;
         }
         if (u.contains("NO ROUTE GUIDANCE") || u.contains("COMPASS")) st.displayTypeCode = 8;
@@ -1333,6 +1454,7 @@ public class CarrotBridgeMain {
             st.remainTimeSec = (hh * 3600) + (mm * 60);
         } else if (timeType == 1) {
             Calendar cal = Calendar.getInstance(TimeZone.getTimeZone("Asia/Seoul"));
+            cal.setTimeInMillis(nowMs());
             int nowH = cal.get(Calendar.HOUR_OF_DAY);
             int nowM = cal.get(Calendar.MINUTE);
             int diffMin = (hh * 60 + mm) - (nowH * 60 + nowM);
@@ -1558,9 +1680,10 @@ public class CarrotBridgeMain {
     private static int parseDistanceWithUnitText(String text) {
         if (text == null || text.isEmpty()) return 0;
         String u = text.toUpperCase(Locale.US);
-        if (u.contains("NONE") || u.contains("INVALID") || u.contains("ERROR")) return 0;
+        if (u.contains("NONE") || u.contains("INVALID") || u.contains("ERROR") || u.contains("UNKNOWN")) return 0;
         double val = parseLeadingDouble(u, 0.0);
-        if (val <= 0.0) return 0;
+        // Gen5W dumpsys prints the all-1s sentinel as "65535.15 unknown scale(0x0f)"
+        if (val <= 0.0 || val >= 65535.0) return 0;
         if (u.contains("KILO") || u.endsWith("KM") || u.contains(" KM")) {
             return (int) Math.round(val * 1000.0);
         }
@@ -1729,7 +1852,7 @@ public class CarrotBridgeMain {
                         try { Thread.sleep(delayMs); } catch (InterruptedException ignored) {}
                     }
                     String nowStr = new SimpleDateFormat("HH:mm:ss", Locale.US).format(new Date());
-                    int rc = runAutoUpdate("GRT47", "HKG_5W_CarrotNavi", "main", installDir, false);
+                    int rc = runAutoUpdate("disdong", "HKG_5W_CarrotNavi", "main", installDir, false);
                     if (rc == 0) {
                         lastAutoUpdateStatus = "최신 버전 유지 중 (v" + BRIDGE_VERSION + ", 확인: " + nowStr + ")";
                         if (fromUi) {
@@ -1832,6 +1955,7 @@ public class CarrotBridgeMain {
         final File dumpDir = new File("/data/local/tmp/hkg_tbt_dump");
         if (!dumpDir.exists()) dumpDir.mkdirs();
         final File traceFile = new File(dumpDir, "tbt_live_trace.log");
+        NewCodeRecorder.init(dumpDir);
         final File statusFile = new File("/data/local/tmp/carrotbridge_status.json");
         final File showUiTriggerFile = new File("/data/local/tmp/carrotbridge_show_ui");
         final File checkUpdateTriggerFile = new File("/data/local/tmp/carrotbridge_check_update");
@@ -1912,6 +2036,7 @@ public class CarrotBridgeMain {
                                 }
                             }
                             parseLogcatLine(line, navState, traceFile);
+                            NewCodeRecorder.onLogLine(line, navState);
                         }
                     } catch (Exception e) {
                         try { Thread.sleep(1000L); } catch (InterruptedException ignored) {}
@@ -2360,6 +2485,19 @@ public class CarrotBridgeMain {
         return sb.toString();
     }
 
+    /** Numeric dotted-version compare ("1.2.10" > "1.2.9"); non-numeric parts count as 0. */
+    static int compareVersions(String a, String b) {
+        String[] pa = (a == null ? "" : a.trim()).split("\\.");
+        String[] pb = (b == null ? "" : b.trim()).split("\\.");
+        int n = Math.max(pa.length, pb.length);
+        for (int i = 0; i < n; i++) {
+            int x = i < pa.length ? parseIntSafe(pa[i].replaceAll("[^0-9]", ""), 0) : 0;
+            int y = i < pb.length ? parseIntSafe(pb[i].replaceAll("[^0-9]", ""), 0) : 0;
+            if (x != y) return x < y ? -1 : 1;
+        }
+        return 0;
+    }
+
     public static int runAutoUpdate(String owner, String repo, String branch, String installDir, boolean force) {
         String nowStr = new SimpleDateFormat("HH:mm:ss", Locale.US).format(new Date());
         File statusNoteFile = new File(installDir, "config/last_update_status.txt");
@@ -2375,6 +2513,16 @@ public class CarrotBridgeMain {
             if (remoteVersion.isEmpty()) {
                 System.out.println("[AutoUpdate] Invalid version.json");
                 return 2;
+            }
+
+            // Never downgrade: the updater used to replace the jar AND scripts/configs on any version mismatch,
+            // so a newer local build (e.g. a USB-installed fork build) was overwritten by an older repo manifest.
+            if (compareVersions(remoteVersion, BRIDGE_VERSION) < 0) {
+                String msg = "현재 v" + BRIDGE_VERSION + " 유지 (저장소 v" + remoteVersion + "가 더 낮음, " + nowStr + ")";
+                System.out.println("[AutoUpdate] Remote " + remoteVersion + " is older than running " + BRIDGE_VERSION + "; skip (no downgrade).");
+                lastAutoUpdateStatus = msg;
+                try { writeBytesAtomic(statusNoteFile, (msg + "\n").getBytes(UTF8)); } catch (Exception ignored) {}
+                return 0;
             }
 
             File localVerFile = new File(installDir, "version.json");
@@ -2549,6 +2697,186 @@ public class CarrotBridgeMain {
     // MAP BUTTON 3-PRESS STATUS DASHBOARD OVERLAY UI (Android 4.4.2 System UI)
     // =========================================================================
 
+    /**
+     * Collects navi guidance codes never seen before on this head unit into tbt_new_codes.log (same dump dir, so it is
+     * exported to USB together with tbt_live_trace.log). Keys already seen are kept in tbt_seen_codes.txt across reboots,
+     * so ordinary driving only adds an entry when the navi emits something new.
+     *   - 0x4E TBT Info: DisplayType + Direction (Direction omitted for 0x8 compass, where it is just the heading)
+     *   - 0x4B Trap Info: categorical fields (WarningZone, NonSpeed, speed info type, Curve/Merge warning, DisplayTG, bus type)
+     * Each entry records the full 0x4E group, crossroad name, remaining distance, what the bridge sends for it, the
+     * preceding guidance code, the last 40 navi log lines, the next 10 navi lines (the crossroad name usually arrives
+     * after the 0x4E group), and the next 2 guidance codes that follow it.
+     * Independent of the parser: it only reads the raw logcat lines.
+     */
+    public static final class NewCodeRecorder {
+        private static final long MAX_LOG_BYTES = 2L * 1024L * 1024L;
+        private static final int RING_SIZE = 40;
+        private static final String[] TRAP_FIELDS = {
+                "WarningZone", "NonSpeed", "speed info type(int)", "CurveWarning", "MergeWarning", "DisplayTG",
+                "bus speed type(int)", "strBusSpdType"
+        };
+        private static File logFile;
+        private static File seenFile;
+        private static final Set<String> seen = new LinkedHashSet<String>();
+        private static final String[] ring = new String[RING_SIZE];
+        private static int ringPos = 0;
+        private static int ringCount = 0;
+        private static final Map<String, String> group = new LinkedHashMap<String, String>();
+        private static String lastGuideKey = "";
+        private static int followUps = 0;
+        private static int postLines = 0;   // navi lines still to append after the latest NEW entry
+
+        public static synchronized void init(File dumpDir) {
+            logFile = new File(dumpDir, "tbt_new_codes.log");
+            seenFile = new File(dumpDir, "tbt_seen_codes.txt");
+            seen.clear();
+            try {
+                if (seenFile.isFile()) {
+                    BufferedReader br = new BufferedReader(new InputStreamReader(new FileInputStream(seenFile), UTF8));
+                    try {
+                        String l;
+                        while ((l = br.readLine()) != null) {
+                            l = l.trim();
+                            if (!l.isEmpty()) seen.add(l);
+                        }
+                    } finally {
+                        br.close();
+                    }
+                }
+            } catch (Exception ignored) {
+            }
+        }
+
+        public static synchronized void onLogLine(String line, NavState st) {
+            if (logFile == null || line == null) return;
+            if (!(line.contains("[IL TBT") || line.contains("[TP ") || line.contains("updateTBT")
+                    || line.contains("GuidStatus") || line.contains("updateTPCrossroadName"))) {
+                return;
+            }
+            if (line.contains("=====")) return;
+            // post-context skips the bulky 0x4B trap / 0x4D sub-info blocks so the crossroad name is not crowded out
+            if (postLines > 0 && !line.contains("[IL TBT Trap Info") && !line.contains("[IL TBT Sub Info")
+                    && !line.contains("updateTBTSubInfo")) {
+                appendRaw("    + " + clock() + " " + line + "\n");
+                postLines--;
+            }
+            ring[ringPos] = clock() + " " + line;
+            ringPos = (ringPos + 1) % RING_SIZE;
+            if (ringCount < RING_SIZE) ringCount++;
+
+            int idx = line.indexOf("[IL TBT Info - 0x4E] ");
+            if (idx >= 0) {
+                String kv = line.substring(idx + "[IL TBT Info - 0x4E] ".length());
+                int eq = kv.indexOf(" = ");
+                if (eq <= 0) return;
+                String k = kv.substring(0, eq).trim();
+                String v = kv.substring(eq + 3).trim();
+                if ("DisplayType".equals(k)) group.clear();
+                group.put(k, v);
+                if ("CombiSideStreet".equals(k) && group.containsKey("DisplayType")) {
+                    onGuideGroup(st);
+                }
+                return;
+            }
+            idx = line.indexOf("[IL TBT Trap Info - 0x4B] ");
+            if (idx >= 0) {
+                String kv = line.substring(idx + "[IL TBT Trap Info - 0x4B] ".length());
+                int eq = kv.indexOf(" = ");
+                if (eq <= 0) return;
+                String k = kv.substring(0, eq).trim();
+                String v = kv.substring(eq + 3).trim();
+                for (String f : TRAP_FIELDS) {
+                    if (f.equals(k)) {
+                        String key = "0x4B " + k + "=" + v;
+                        if (!seen.contains(key)) record(key, st, "단속/안전 정보 코드");
+                        break;
+                    }
+                }
+            }
+        }
+
+        private static void onGuideGroup(NavState st) {
+            String dt = group.get("DisplayType");
+            String dir = group.containsKey("Direction") ? group.get("Direction") : "?";
+            boolean compass = "0x8".equalsIgnoreCase(dt) || "8".equals(dt);
+            String key = "0x4E DisplayType=" + dt + (compass ? "" : " Direction=" + dir);
+            if (key.equals(lastGuideKey)) return;
+            if (followUps > 0 && !seen.contains(key)) {
+                // the follow-up itself is new: it gets its own entry below
+            } else if (followUps > 0) {
+                appendRaw("    → 이후 안내: " + key + " | Distance=" + group.get("Distance")
+                        + " | BarGraph=" + group.get("BarGraphLevel") + " | 교차로명=" + crossName(st) + "\n");
+                followUps--;
+            }
+            String prevKey = lastGuideKey;
+            lastGuideKey = key;
+            if (!seen.contains(key)) {
+                record(key, st, "주행안내(TBT) 코드, 직전 안내: " + (prevKey.isEmpty() ? "-" : prevKey));
+                followUps = 2;
+            }
+        }
+
+        private static void record(String key, NavState st, String kind) {
+            if (logFile.exists() && logFile.length() > MAX_LOG_BYTES) return; // full: leave unseen so it is caught after cleanup
+            StringBuilder sb = new StringBuilder(4096);
+            sb.append("\n######## NEW ").append(clock()).append("  ").append(key).append('\n');
+            sb.append("  종류: ").append(kind).append('\n');
+            if (!group.isEmpty()) sb.append("  0x4E 현재값: ").append(group).append('\n');
+            int bridgeTurn;
+            int remain;
+            synchronized (st) {
+                bridgeTurn = mapHkmcToCarrotTurnType(st.displayTypeCode, st.tbtDirectionDeg, st.sccNextTurnType1, st.displayTG, st.tollGateFee);
+                remain = st.remainDistM;
+            }
+            sb.append("  교차로명: ").append(crossName(st)).append(" | 목적지까지: ").append(remain).append("m")
+                    .append(" | 브릿지 전송 nTBTTurnType: ").append(bridgeTurn).append('\n');
+            sb.append("  직전 로그 ").append(ringCount).append("줄:\n");
+            for (int i = 0; i < ringCount; i++) {
+                String l = ring[(ringPos - ringCount + i + RING_SIZE) % RING_SIZE];
+                if (l != null) sb.append("    ").append(l).append('\n');
+            }
+            sb.append("  이후 로그 (교차로명은 보통 안내 코드 뒤에 옴):\n");
+            appendRaw(sb.toString());
+            postLines = 10;
+            seen.add(key);
+            try {
+                FileOutputStream fos = new FileOutputStream(seenFile, true);
+                try {
+                    fos.write((key + "\n").getBytes(UTF8));
+                } finally {
+                    fos.close();
+                }
+            } catch (Exception ignored) {
+            }
+        }
+
+        private static String crossName(NavState st) {
+            synchronized (st) {
+                return st.crossroadName == null || st.crossroadName.isEmpty() ? "-" : st.crossroadName;
+            }
+        }
+
+        private static void appendRaw(String text) {
+            try {
+                File parent = logFile.getParentFile();
+                if (parent != null && !parent.exists()) parent.mkdirs();
+                FileOutputStream fos = new FileOutputStream(logFile, true);
+                try {
+                    fos.write(text.getBytes(UTF8));
+                } finally {
+                    fos.close();
+                }
+            } catch (Exception ignored) {
+            }
+        }
+
+        private static String clock() {
+            SimpleDateFormat f = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US);
+            f.setTimeZone(TimeZone.getTimeZone("Asia/Seoul"));
+            return f.format(new Date(nowMs()));
+        }
+    }
+
     public static final class StatusDashboardOverlay {
         private static volatile String installDir = "/data/nemesis/apps/carrotnavi.bridge";
         private static volatile NavState navStateRef = null;
@@ -2559,6 +2887,7 @@ public class CarrotBridgeMain {
         private static volatile Object headerSysInfoTextView = null;
         private static volatile Object leftColTextView = null;
         private static volatile Object autoHotspotCheckTextView = null;
+        private static volatile Object autoWifiCheckTextView = null;
         private static volatile Object rightColTextView = null;
         private static volatile Object commaTxCheckTextView = null;
         private static volatile Object footerStatusTextView = null;
@@ -2832,6 +3161,21 @@ public class CarrotBridgeMain {
             setMargins(autoHsCheckLp, 0, 10, 0, 0);
             vgCls.getMethod("addView", viewCls, vgLpCls).invoke(leftCard, autoHsCheckTv, autoHsCheckLp);
 
+            // Interactive Checkbox for Wi-Fi client (STA) auto-on at ignition (ON/OFF)
+            Object autoWifiCheckTv = tvCtor.newInstance(sysContext);
+            styleAutoWifiCheckbox(autoWifiCheckTv, isAutoWifiClientEnabled());
+            tvSetGravity.invoke(autoWifiCheckTv, 17); // CENTER
+            viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class).invoke(autoWifiCheckTv, 12, 8, 12, 8);
+            attachClickListener(autoWifiCheckTv, new Runnable() {
+                @Override
+                public void run() {
+                    toggleAutoWifiClientFromUi();
+                }
+            });
+            Object autoWifiCheckLp = llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT);
+            setMargins(autoWifiCheckLp, 0, 10, 0, 0);
+            vgCls.getMethod("addView", viewCls, vgLpCls).invoke(leftCard, autoWifiCheckTv, autoWifiCheckLp);
+
             Object leftCardLp = llLpCtor3.newInstance(0, MATCH_PARENT, 1.0f);
             setMargins(leftCardLp, 0, 0, 8, 0);
             vgCls.getMethod("addView", viewCls, vgLpCls).invoke(bodyRow, leftCard, leftCardLp);
@@ -2967,7 +3311,7 @@ public class CarrotBridgeMain {
             tvCls.getMethod("setGravity", int.class).invoke(footerTv, 17); // CENTER
             vgCls.getMethod("addView", viewCls, vgLpCls).invoke(root, footerTv, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
 
-            return new Object[]{root, leftTv, rightTv, footerTv, sysInfoTv, autoHsCheckTv, commaTxCheckTv};
+            return new Object[]{root, leftTv, rightTv, footerTv, sysInfoTv, autoHsCheckTv, commaTxCheckTv, autoWifiCheckTv};
         }
 
         private static void showOnUiThread() {
@@ -3030,6 +3374,7 @@ public class CarrotBridgeMain {
                         headerSysInfoTextView = tree.length > 4 ? tree[4] : null;
                         autoHotspotCheckTextView = tree.length > 5 ? tree[5] : null;
                         commaTxCheckTextView = tree.length > 6 ? tree[6] : null;
+                        autoWifiCheckTextView = tree.length > 7 ? tree[7] : null;
                         isVisible = true;
                         shownAtMs = System.currentTimeMillis();
                         System.out.println("[CarrotBridge] StatusDashboardOverlay displayed (windowType=" + wtype + ")");
@@ -3057,6 +3402,7 @@ public class CarrotBridgeMain {
             headerSysInfoTextView = null;
             leftColTextView = null;
             autoHotspotCheckTextView = null;
+            autoWifiCheckTextView = null;
             rightColTextView = null;
             commaTxCheckTextView = null;
             footerStatusTextView = null;
@@ -3172,6 +3518,9 @@ public class CarrotBridgeMain {
                 if (autoHotspotCheckTextView != null) {
                     styleAutoHotspotCheckbox(autoHotspotCheckTextView, isBootAutoHotspotEnabled());
                 }
+                if (autoWifiCheckTextView != null) {
+                    styleAutoWifiCheckbox(autoWifiCheckTextView, isAutoWifiClientEnabled());
+                }
                 if (commaTxCheckTextView != null) {
                     styleCommaTxCheckbox(commaTxCheckTextView, commaTxEnabled);
                 }
@@ -3238,6 +3587,61 @@ public class CarrotBridgeMain {
                     postToUi(REFRESH_TASK);
                 }
             }, "ToggleBootAutoHotspot").start();
+        }
+
+        /** config/wifi_auto.conf: "1" = turn the Wi-Fi client (STA) on at ignition. Default OFF. Read by bridge-daemon.sh. */
+        private static boolean isAutoWifiClientEnabled() {
+            try {
+                File conf = new File(installDir, "config/wifi_auto.conf");
+                if (conf.isFile()) {
+                    return "1".equals(readFirstLineQuick(conf));
+                }
+            } catch (Throwable ignored) {
+            }
+            return false;
+        }
+
+        private static void styleAutoWifiCheckbox(Object view, boolean enabled) throws Exception {
+            if (enabled) {
+                setTextViewStyle(view, "☑ 시동 시 Wi-Fi(스마트폰 핫스팟 수신) 자동 켜기 : ON (터치하여 변경)", 14.5f, 0xFFFFFFFF, true);
+                setRoundedBg(view, 0xFF065F46, 0xFF34D399, 2, 10f);
+            } else {
+                setTextViewStyle(view, "☐ 시동 시 Wi-Fi(스마트폰 핫스팟 수신) 자동 켜기 : OFF (터치하여 변경)", 14.5f, 0xFFCBD5E1, true);
+                setRoundedBg(view, 0xFF334155, 0xFF64748B, 2, 10f);
+            }
+        }
+
+        private static void toggleAutoWifiClientFromUi() {
+            final boolean nextState = !isAutoWifiClientEnabled();
+            try {
+                File conf = new File(installDir, "config/wifi_auto.conf");
+                writeBytesAtomic(conf, (nextState ? "1\n" : "0\n").getBytes(UTF8));
+            } catch (Throwable ignored) {
+            }
+            final boolean hotspotAutoOn = isBootAutoHotspotEnabled();
+            if (!nextState) {
+                actionBannerMsg = "ℹ️ 시동 시 Wi-Fi 자동 켜기가 [OFF]로 해제되었습니다.";
+            } else if (hotspotAutoOn) {
+                actionBannerMsg = "⚠️ Wi-Fi 자동 켜기 [ON] 저장. 단, '부팅 시 핫스팟 자동 활성화'가 ON이면 핫스팟이 우선이라 동작하지 않습니다.";
+            } else {
+                actionBannerMsg = "✅ 시동 시 Wi-Fi 자동 켜기가 [ON]으로 설정되었습니다. (지금 Wi-Fi 켜는 중)";
+            }
+            postToUi(REFRESH_TASK);
+            if (nextState && !hotspotAutoOn) {
+                new Thread(new Runnable() {
+                    @Override
+                    public void run() {
+                        try {
+                            String st = execCommandCapture(new String[]{"/system/bin/service", "call", "wifi", "14"}, 5);
+                            if (st == null || !(st.contains("00000002") || st.contains("00000003"))) {
+                                execCommandCapture(new String[]{"/system/bin/service", "call", "wifi", "13", "i32", "1"}, 10);
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                        postToUi(REFRESH_TASK);
+                    }
+                }, "ToggleAutoWifiClient").start();
+            }
         }
 
         private static void styleCommaTxCheckbox(Object view, boolean enabled) throws Exception {
@@ -3448,7 +3852,7 @@ public class CarrotBridgeMain {
         }
 
         private static void triggerManualUpdateFromUi() {
-            actionBannerMsg = "⏳ GitHub 최신 버전(GRT47/HKG_5W_CarrotNavi) 확인 중...";
+            actionBannerMsg = "⏳ GitHub 최신 버전(disdong/HKG_5W_CarrotNavi) 확인 중...";
             postToUi(REFRESH_TASK);
             triggerBackgroundAutoUpdate(installDir, 0L, true);
         }
@@ -3876,6 +4280,115 @@ public class CarrotBridgeMain {
             throw new AssertionError("SCC all-1s sentinel normalization mismatch");
         }
 
+        // 1f. Regression: K7 PE (wp_daudioplus_ygpe_kr) commute 2026-11-08, verbatim lines.
+        //     TG approach ramp / expressway exit are TURN + Direction 22.5 -> slight right (6), never a 90 deg turn (13).
+        //     Extended DisplayType bytes 0xB2 (toll gate), 0x42/0x46 (follow road), 0x71 (destination ahead).
+        //     Lossy dumpsys SubInfo ("18.5 METER", "minutes = 12" of a 20:12 ETA) must not override fresh logcat.
+        try {
+            NavState k7 = new NavState();
+            clockOverrideMs = 1794135295997L; // 2026-11-08 19:54:55 KST, ETA 20:12 -> 18 min
+            parseLogcatLine("D/ClusterService(  538): NaviCluster.updateSCC_HU_Navi_P() msgGroupNum1: 7 setDestStatus: 3 offRouteStatus: 7 nextTurnType1: 31 naviValidity: 0 nextTurnDist1: 4095 nextTurnDist2: 4095 curLinkCntLane: 15 curRoadClass: 15 curLinkClass: 15 nextTurnType2: 31", k7, null);
+            parseLogcatLine("I/Java_Layer( 1242): [Cluster] [IL TBT Info - 0x4E] DisplayType = 0xd", k7, null);
+            parseLogcatLine("I/Java_Layer( 1242): [Cluster] [IL TBT Info - 0x4E] Direction = 22.5", k7, null);
+            parseLogcatLine("I/Java_Layer( 1242): [Cluster] [IL TBT Info - 0x4E] Distance = 130.0 m", k7, null);
+            parseLogcatLine("I/Java_Layer( 1242): [Cluster] [IL TBT Info - 0x4E] BarGraphLevel = 30%", k7, null);
+            parseLogcatLine("D/NavigationCluster( 1242): updateTBTSubInfo() distance: 18.5 unit: 1", k7, null);
+            parseLogcatLine("I/Java_Layer( 1242): [Cluster] [IL TBT Sub Info - 0x4D] Distance To Destination = 18.5km", k7, null);
+            parseLogcatLine("I/Java_Layer( 1242): [Cluster] [IL TBT Sub Info - 0x4D] TimeType = 1", k7, null);
+            parseLogcatLine("I/Java_Layer( 1242): [Cluster] [IL TBT Sub Info - 0x4D] Time = 20:12", k7, null);
+            parseLogcatLine("D/ClusterService(  538): NaviCluster.updateTBTSubInfo2C() distToPoint1_unit: 0 distToPoint1_F: 0 distToPoint1_I: 130 distToPoint2_unit: 0 distToPoint2_F: 0 distToPoint2_I: 600 distToPoint3_unit: 1 distToPoint3_F: 5 distToPoint3_I: 13", k7, null);
+            clockOverrideMs += 300L;
+            parseDumpsysCluster("Navigation Cluster:\n  TBT SubInfo:\n    distance      = 18.5 METER\n    minutes       = 12\n    time type     = 1\n"
+                    + "  TBT SubInfo2:\n    next 1        = 0.0 DISTANCE NONE\n    next 2        = 0.0 DISTANCE NONE\n"
+                    + "  TBT Info:\n    Display Type  = TURN\n    Direction     = 22.5\n    Distance      = 130.0 METER\n    BarGraph Level= 30\n", k7);
+            CarrotPacket ramp = buildCarrotPacket(k7);
+            if (ramp.nTBTTurnType != 6 || ramp.nTBTDist != 130 || !"우측 방향".equals(ramp.szTBTMainText)) {
+                throw new AssertionError("K7: TURN 22.5deg must be slight right (6), not right turn: " + ramp.toJson());
+            }
+            if (ramp.nGoPosDist != 18500 || ramp.nGoPosTime != 18 * 60 || ramp.nTBTDistNext != 600) {
+                throw new AssertionError("K7: dumpsys SubInfo must not override fresh logcat (18.5km / 18min / next 600m): " + ramp.toJson());
+            }
+
+            parseLogcatLine("I/Java_Layer( 1242): [Cluster] [IL TBT Info - 0x4E] DisplayType = 0xb2", k7, null);
+            parseLogcatLine("I/Java_Layer( 1242): [Cluster] [IL TBT Info - 0x4E] Direction = 1912.5", k7, null);
+            parseLogcatLine("I/Java_Layer( 1242): [Cluster] [IL TBT Info - 0x4E] Distance = 500.0 m", k7, null);
+            parseLogcatLine("I/Java_Layer( 1242): [Cluster] [TP Crossroad Name - 0x4F(0xF0)] Crossroad Name = 서호학산톨게이트", k7, null);
+            CarrotPacket tg = buildCarrotPacket(k7);
+            if (tg.nTBTTurnType != 153 || tg.nTBTDist != 500) {
+                throw new AssertionError("K7: DisplayType 0xB2 must be toll gate (153): " + tg.toJson());
+            }
+
+            parseLogcatLine("I/Java_Layer( 1242): [Cluster] [IL TBT Info - 0x4E] DisplayType = 0x42", k7, null);
+            parseLogcatLine("I/Java_Layer( 1242): [Cluster] [IL TBT Info - 0x4E] Distance = 13.5 km", k7, null);
+            parseLogcatLine("I/Java_Layer( 1242): [Cluster] [TP Crossroad Name - 0x4F(0xF0)] Crossroad Name = ", k7, null);
+            parseDumpsysCluster("Navigation Cluster:\n  TBT Info:\n    Display Type  = Unknown display type(0x42)\n    Direction     = 1912.5\n    Distance      = 13.5 KILO METER\n", k7);
+            CarrotPacket hw = buildCarrotPacket(k7);
+            if (hw.nTBTTurnType != 51 || hw.nTBTDist != 13500 || !"직진 주행".equals(hw.szTBTMainText)) {
+                throw new AssertionError("K7: 0x42 / dumpsys 'Unknown display type(0x42)' must be follow road: " + hw.toJson());
+            }
+
+            parseLogcatLine("I/Java_Layer( 1242): [Cluster] [IL TBT Info - 0x4E] DisplayType = 0x71", k7, null);
+            parseLogcatLine("I/Java_Layer( 1242): [Cluster] [IL TBT Info - 0x4E] Direction = 0.0", k7, null);
+            parseLogcatLine("I/Java_Layer( 1242): [Cluster] [IL TBT Info - 0x4E] Distance = 200.0 m", k7, null);
+            CarrotPacket near = buildCarrotPacket(k7);
+            if (near.nTBTTurnType != 201 || near.nTBTDist != 200) {
+                throw new AssertionError("K7: 0x71 must be destination ahead (201): " + near.toJson());
+            }
+
+            parseDumpsysCluster("Navigation Cluster:\n  TBT Info:\n    Display Type  = ARRIVED\n    Direction     = 1912.5\n    Distance      = 65535.15 unknown scale(0x0f)\n", k7);
+            parseLogcatLine("I/Java_Layer( 1242): [Cluster] [IL TBT Info - 0x4E] Distance = Invalid.Invalid Invalid", k7, null);
+            CarrotPacket arr = buildCarrotPacket(k7);
+            if (arr.nTBTDist == 65535 || arr.nTBTDist > 1000) {
+                throw new AssertionError("K7: '65535.15 unknown scale' sentinel leaked into nTBTDist: " + arr.toJson());
+            }
+
+            // Direction band table (22.5 deg steps)
+            double[] degs = {0.0, 22.5, 45.0, 90.0, 112.5, 135.0, 157.5, 180.0, 202.5, 225.0, 247.5, 270.0, 315.0, 337.5, 360.0};
+            int[] want =    {51,  6,    13,   13,   13,    19,    19,    14,    16,    16,    12,    12,    12,    7,     51};
+            for (int i = 0; i < degs.length; i++) {
+                if (mapTurnDirectionToCarrot(degs[i]) != want[i]) {
+                    throw new AssertionError("Direction band mismatch at " + degs[i] + ": " + mapTurnDirectionToCarrot(degs[i]));
+                }
+            }
+            if (mapTurnDirectionToCarrot(1912.5) != -1) throw new AssertionError("1912.5 sentinel must be invalid");
+        } finally {
+            clockOverrideMs = -1L;
+        }
+
+        // 1g. Updater must never downgrade
+        if (compareVersions("1.2.6", "1.2.7") >= 0 || compareVersions("1.2.10", "1.2.9") <= 0 || compareVersions("1.2.7", "1.2.7") != 0) {
+            throw new AssertionError("compareVersions mismatch");
+        }
+
+        // 1h. NewCodeRecorder: a code is written once, remembered across restarts, and followed by post-context lines
+        File recDir = new File(System.getProperty("java.io.tmpdir"), "carrotbridge_selftest_" + System.nanoTime());
+        try {
+            NavState rs = new NavState();
+            String[] grp = {
+                    "I/Java_Layer( 1242): [Cluster] [IL TBT Info - 0x4E] DisplayType = 0xb2",
+                    "I/Java_Layer( 1242): [Cluster] [IL TBT Info - 0x4E] Direction = 1912.5",
+                    "I/Java_Layer( 1242): [Cluster] [IL TBT Info - 0x4E] Distance = 500.0 m",
+                    "I/Java_Layer( 1242): [Cluster] [IL TBT Info - 0x4E] BarGraphLevel = 50%",
+                    "I/Java_Layer( 1242): [Cluster] [IL TBT Info - 0x4E] SideStreet = 0x0 (0)",
+                    "I/Java_Layer( 1242): [Cluster] [IL TBT Info - 0x4E] CombiSideStreet = 0x0 (0)",
+                    "I/Java_Layer( 1242): [Cluster] [TP Crossroad Name - 0x4F(0xF0)] Crossroad Name = 서호학산톨게이트"
+            };
+            NewCodeRecorder.init(recDir);
+            for (String l : grp) NewCodeRecorder.onLogLine(l, rs);
+            for (String l : grp) NewCodeRecorder.onLogLine(l, rs);
+            NewCodeRecorder.init(recDir); // simulate daemon restart
+            for (String l : grp) NewCodeRecorder.onLogLine(l, rs);
+            String recLog = new String(readAllBytes(new FileInputStream(new File(recDir, "tbt_new_codes.log"))), UTF8);
+            int n = recLog.split("NEW .{19}  0x4E DisplayType=0xb2 Direction=1912.5", -1).length - 1;
+            if (n != 1 || !recLog.contains("서호학산톨게이트")) {
+                throw new AssertionError("NewCodeRecorder: expected exactly one 0xb2 entry with post-context crossroad name, got " + n);
+            }
+        } finally {
+            File[] fs = recDir.listFiles();
+            if (fs != null) for (File f : fs) f.delete();
+            recDir.delete();
+        }
+
         // 2. Test Section Control + Average Speed (SCC_HU_Navi_P)
         parseLogcatLine("D/ClusterService(  612): NaviCluster.updateSCC_HU_Navi_P() msgGroupNum1: 1 setDestStatus: 1 rangeCamInfo: 1 rangeCamDist: 6840 rangeCamSpdLimit: 10 rangeCamAvgMovingSpd: 94", st, null);
         CarrotPacket secPkt = buildCarrotPacket(st);
@@ -3970,7 +4483,7 @@ public class CarrotBridgeMain {
             String installDir = args.length >= 2 ? args[1] : "/data/nemesis/apps/carrotnavi.bridge";
             runDaemon(installDir);
         } else if ("update".equals(args[0])) {
-            String owner = args.length >= 2 ? args[1] : "GRT47";
+            String owner = args.length >= 2 ? args[1] : "disdong";
             String repo = args.length >= 3 ? args[2] : "HKG_5W_CarrotNavi";
             String branch = args.length >= 4 ? args[3] : "main";
             String installDir = args.length >= 5 ? args[4] : "/data/nemesis/apps/carrotnavi.bridge";

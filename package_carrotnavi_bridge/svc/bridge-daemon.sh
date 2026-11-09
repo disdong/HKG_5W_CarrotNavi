@@ -120,6 +120,35 @@ enable_hotspot() {
     log_info "Triggered setWifiApEnabled(null, true) [subscription=true, apn=Public]"
 }
 
+# Wi-Fi client (STA) auto-on at ignition: dashboard checkbox -> config/wifi_auto.conf ("1" = ON, default OFF).
+# SoftAP and STA cannot run together on this head unit, so this only acts while the boot auto-hotspot option is OFF.
+WIFI_AUTO_CONF="$INSTALL_DIR/config/wifi_auto.conf"
+WIFI_AUTO_TRIES=0
+
+is_wifi_auto_enabled() {
+    [ -f "$WIFI_AUTO_CONF" ] || return 1
+    case "$(cat "$WIFI_AUTO_CONF" 2>/dev/null)" in
+        *1*) return 0 ;;
+    esac
+    return 1
+}
+
+# Returns 0 when Wi-Fi is enabling/enabled (or nothing to do), 1 when an enable was requested and should be re-checked.
+ensure_wifi_client() {
+    is_wifi_auto_enabled || return 0
+    [ "$(getprop persist.sys.hotspot.auto)" = "0" ] || return 0
+    is_softap_active && return 0
+    wifi_state="$(service call wifi 14 2>/dev/null)"
+    case "$wifi_state" in
+        *00000002*|*00000003*)
+            return 0
+            ;;
+    esac
+    service call wifi 13 i32 1 >/dev/null 2>&1
+    log_info "Wi-Fi auto-on: setWifiEnabled(true) requested (state was: ${wifi_state})"
+    return 1
+}
+
 disable_hotspot() {
     service call wifi 29 i32 0 i32 0 >/dev/null 2>&1
     log_info "Triggered setWifiApEnabled(null, false)"
@@ -157,11 +186,11 @@ check_bridge_java_watchdog() {
 }
 
 run_github_update_check() {
-    log_info "Triggering GitHub Auto-Update check (GRT47/HKG_5W_CarrotNavi)..."
+    log_info "Triggering GitHub Auto-Update check (disdong/HKG_5W_CarrotNavi)..."
     if [ -n "$BRIDGE_PID" ] && kill -0 "$BRIDGE_PID" 2>/dev/null; then
         echo 1 > /data/local/tmp/carrotbridge_check_update 2>/dev/null
     else
-        CLASSPATH="$INSTALL_DIR/bin/carrotbridge.jar" /system/bin/app_process /system/bin com.hkg.carrotbridge.CarrotBridgeMain update GRT47 HKG_5W_CarrotNavi main "$INSTALL_DIR" 2>&1
+        CLASSPATH="$INSTALL_DIR/bin/carrotbridge.jar" /system/bin/app_process /system/bin com.hkg.carrotbridge.CarrotBridgeMain update disdong HKG_5W_CarrotNavi main "$INSTALL_DIR" 2>&1
     fi
 }
 
@@ -211,6 +240,9 @@ if [ "$(getprop persist.sys.hotspot.auto)" != "0" ]; then
     fi
 fi
 
+# Wi-Fi client auto-on (cold boot): re-checked for up to 6 loops (~30 s) while system services settle
+WIFI_AUTO_TRIES=6
+
 # Wake up com.mnsoft.navi [Cluster] plain-text TBT logger
 am broadcast -a com.android.Eng.LogSetting --eia intArray 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0 >/dev/null 2>&1
 
@@ -221,6 +253,7 @@ LOOP_COUNT=0
 USB_DUMPED_SESSION=0
 NAVI_STARTUP_UPDATED=0
 WAS_SLEEP_OR_OFF=0
+WIFI_WAKE_PENDING=0
 
 while true; do
     LOOP_COUNT=$((LOOP_COUNT + 1))
@@ -261,6 +294,21 @@ while true; do
         apply_hotspot_props
         if ! is_softap_active; then
             enable_hotspot
+        fi
+    fi
+
+    # 1b. Wi-Fi client auto-on: on cold boot and on every screen-on after ACC OFF / sleep (warm wake)
+    if [ "$(getprop tcc.hwc.lcd.disable)" = "1" ] || [ "$(getprop sys.boot.show_screen)" = "false" ]; then
+        WIFI_WAKE_PENDING=1
+    elif [ "$WIFI_WAKE_PENDING" = "1" ]; then
+        WIFI_WAKE_PENDING=0
+        WIFI_AUTO_TRIES=6
+    fi
+    if [ "$WIFI_AUTO_TRIES" -gt 0 ]; then
+        if ensure_wifi_client; then
+            WIFI_AUTO_TRIES=0
+        else
+            WIFI_AUTO_TRIES=$((WIFI_AUTO_TRIES - 1))
         fi
     fi
 
